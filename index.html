@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>YouTube Interest Profiler — Win95</title>
+  <meta name="description" content="Your YouTube taste profile, rendered as a Windows 95 desktop." />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body data-theme="dusk">
+  <!-- ============================ THE DESKTOP ============================ -->
+  <main class="win-wrapper" id="wrapper">
+    <!-- Desktop icons get injected here by app.js -->
+    <div class="desktop" id="desktop" aria-label="Desktop"></div>
+
+    <!-- Open windows get injected here by app.js -->
+    <div class="window-layer" id="window-layer"></div>
+
+    <!-- Toast (e.g. "showing demo data") lives above the taskbar -->
+    <div class="toast" id="toast" role="status" hidden></div>
+
+    <!-- ============================ START MENU ============================ -->
+    <nav class="start-menu" id="start-menu" hidden aria-label="Start menu">
+      <div class="start-sidebar"><span>Profiler<b>95</b></span></div>
+      <ul class="start-list" id="start-items"></ul>
+    </nav>
+
+    <!-- ============================= TASKBAR ============================== -->
+    <footer class="taskbar" id="taskbar">
+      <button class="start-button" id="start-button" aria-haspopup="true" aria-expanded="false">
+        <span class="win-flag" aria-hidden="true"></span>
+        <span class="start-text">Start</span>
+      </button>
+      <div class="task-divider" aria-hidden="true"></div>
+      <div class="tasks" id="tasks" aria-label="Open windows"></div>
+      <div class="tray">
+        <div class="clock" id="clock" title="Date and time">--:--</div>
+      </div>
+    </footer>
+  </main>
+
+  <!-- ========================== SHUTDOWN SCREEN ========================== -->
+  <div class="shutdown-screen" id="shutdown" hidden>
+    <div class="shutdown-inner">
+      <p class="shutdown-msg">It is now safe to turn off<br />your computer.</p>
+      <button class="btn" id="restart-btn">Restart</button>
+    </div>
+  </div>
+
+  <noscript>
+    <p style="font-family:Tahoma,sans-serif;padding:24px">
+      This desktop needs JavaScript to boot. Enable it and reload.
+    </p>
+  </noscript>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
