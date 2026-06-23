@@ -53,6 +53,7 @@ import re
 import sys
 import json
 import time
+import tempfile
 import argparse
 import threading
 import webbrowser
@@ -76,13 +77,13 @@ MAX_RETRIES   = 3
 
 
 # ── Lazy imports (so --sample works without Chrome/Groq installed) ────────────
-def _require_selenium():
+def _get_by():
+    """Return Selenium's `By` locator class. Only needs `selenium` (not uc)."""
     try:
-        import undetected_chromedriver as uc
         from selenium.webdriver.common.by import By
-        return uc, By
+        return By
     except Exception as e:
-        sys.exit(f"❌  Selenium stack missing: {e}\n    pip install undetected-chromedriver selenium")
+        sys.exit(f"❌  Selenium is missing: {e}\n    pip install selenium undetected-chromedriver")
 
 
 def _groq_client():
@@ -96,14 +97,181 @@ def _groq_client():
 
 
 # ── Browser launch ────────────────────────────────────────────────────────────
-def launch_driver():
-    uc, _ = _require_selenium()
-    print("  🚀  Launching a clean Chrome session…")
+# Flags shared by every launch path.
+_CHROME_FLAGS = ("--start-maximized", "--no-first-run", "--no-default-browser-check")
+
+# A dedicated profile folder, kept separate from your everyday Chrome. This stops
+# the launched window from handing itself off to a Chrome you already have open
+# (which would make it exit immediately → "chrome not reachable"). It also means
+# you stay logged in across runs. Delete this folder if you ever want a fresh login.
+_DEDICATED_PROFILE = str(Path(tempfile.gettempdir()) / "yt-profiler-chrome")
+
+
+def _is_elevated():
+    """True if running as Administrator on Windows. Chrome's sandbox can't start
+    inside an elevated process, so when this is True we launch with --no-sandbox."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+
+def _detect_chrome_major():
+    """Best-effort: return the installed Chrome MAJOR version (int) or None.
+
+    Matching the driver to the installed Chrome is what fixes the
+    'cannot connect to chrome … chrome not reachable' error that shows up
+    after Chrome silently auto-updates.
+    """
+    import subprocess
+
+    if sys.platform.startswith("win"):
+        # The registry is the most reliable source on Windows.
+        try:
+            out = subprocess.run(
+                ["reg", "query",
+                 r"HKEY_CURRENT_USER\Software\Google\Chrome\BLBeacon", "/v", "version"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            m = re.search(r"version\s+REG_SZ\s+(\d+)\.", out)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
+        # Fall back to reading chrome.exe's own version string.
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    out = subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         f"(Get-Item '{path}').VersionInfo.ProductVersion"],
+                        capture_output=True, text=True, timeout=5,
+                    ).stdout.strip()
+                    m = re.match(r"(\d+)\.", out)
+                    if m:
+                        return int(m.group(1))
+                except Exception:
+                    pass
+    else:
+        # macOS / Linux — try the usual binaries.
+        for cmd in (
+            ["google-chrome", "--version"],
+            ["google-chrome-stable", "--version"],
+            ["chromium", "--version"],
+            ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--version"],
+        ):
+            try:
+                out = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+                m = re.search(r"\b(\d+)\.\d+", out)
+                if m:
+                    return int(m.group(1))
+            except Exception:
+                pass
+    return None
+
+
+def _launch_uc(extra_flags):
+    """Preferred path: undetected-chromedriver, pinned to the installed Chrome."""
+    import undetected_chromedriver as uc
+
+    # uc raises a scary (but harmless) WinError 6 from its __del__ when a launch
+    # fails. Silence it so the *real* error is the only thing the user sees.
+    try:
+        _orig_del = uc.Chrome.__del__
+
+        def _quiet_del(self, _orig=_orig_del):
+            try:
+                _orig(self)
+            except Exception:
+                pass
+
+        uc.Chrome.__del__ = _quiet_del
+    except Exception:
+        pass
+
     options = uc.ChromeOptions()
-    options.add_argument("--start-maximized")
-    options.add_argument("--no-first-run")
-    options.add_argument("--no-default-browser-check")
-    return uc.Chrome(options=options, use_subprocess=True)
+    for flag in (*_CHROME_FLAGS, *extra_flags):
+        options.add_argument(flag)
+
+    kwargs = {"options": options, "use_subprocess": True}
+    major = _detect_chrome_major()
+    if major:
+        print(f"      Detected Chrome {major} — matching the driver to it.")
+        kwargs["version_main"] = major
+    return uc.Chrome(**kwargs)
+
+
+def _launch_selenium(extra_flags):
+    """Fallback path: plain Selenium. Selenium Manager (Selenium ≥4.6) downloads
+    the exact matching chromedriver automatically, so this keeps working through
+    the Chrome auto-updates that break undetected-chromedriver. A couple of
+    stealth flags keep a logged-in feed scroll behaving normally.
+    """
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+
+    opts = Options()
+    for flag in (*_CHROME_FLAGS, *extra_flags):
+        opts.add_argument(flag)
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+
+    driver = webdriver.Chrome(options=opts)  # Selenium Manager fetches the driver
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"},
+        )
+    except Exception:
+        pass
+    return driver
+
+
+def launch_driver():
+    """Open Chrome, trying the stealthiest path first and degrading gracefully.
+
+    1. undetected-chromedriver, pinned to the installed Chrome version.
+    2. plain Selenium (Selenium Manager auto-matches the driver).
+
+    Works whether the terminal is elevated (Administrator) or not: when elevated,
+    Chrome's sandbox can't start, so we add --no-sandbox automatically.
+    """
+    print("  🚀  Launching a dedicated Chrome session…")
+
+    # Build the per-environment flags once, so any "elevated" notice prints once.
+    extra_flags = [f"--user-data-dir={_DEDICATED_PROFILE}"]
+    if _is_elevated():
+        print("      Administrator terminal detected — disabling Chrome's sandbox so it can launch.")
+        extra_flags += ["--no-sandbox", "--disable-dev-shm-usage"]
+
+    try:
+        return _launch_uc(extra_flags)
+    except Exception as e:
+        print(f"  ⚠️  undetected-chromedriver couldn't start ({type(e).__name__}).")
+        print("      Falling back to standard Selenium (auto-matched driver)…")
+    try:
+        return _launch_selenium(extra_flags)
+    except Exception as e:
+        sys.exit(
+            "❌  Couldn't start Chrome with either driver.\n"
+            f"    Last error: {type(e).__name__}: {e}\n\n"
+            "    Things that fix this almost every time:\n"
+            "      • Fully close every Chrome window, then run this again.\n"
+            "      • Update Chrome (chrome://settings/help), then reopen the terminal.\n"
+            "      • Delete the dedicated profile folder and retry:\n"
+            f"          {_DEDICATED_PROFILE}\n"
+            "      • pip install -U undetected-chromedriver selenium\n"
+        )
 
 
 # ── Scraping ──────────────────────────────────────────────────────────────────
@@ -129,13 +297,13 @@ def _collect_titles(driver, By, target, max_scrolls, label):
 
 
 def scrape_feed_titles(driver, target=TARGET_VIDEOS):
-    _, By = _require_selenium()
+    By = _get_by()
     print(f"  🔍  Scrolling the YouTube feed for ~{target} titles…")
     return _collect_titles(driver, By, target, max_scrolls=35, label="feed")
 
 
 def scrape_history_titles(driver, target=HISTORY_TARGET):
-    _, By = _require_selenium()
+    By = _get_by()
     print("  📼  Switching to Watch History for a deeper read…")
     driver.get("https://www.youtube.com/feed/history")
     time.sleep(3)
